@@ -31,7 +31,7 @@ ELBとEC2インスタンスに設定されているState、Role、Envタグを�
 
 ## Install
 ```
-$ git clone xxx
+$ git clone https://github.com/om732/linkage.git
 ```
 
 ## Setup

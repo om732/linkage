@@ -1,0 +1,266 @@
+#!/usr/bin/env python
+# -*-coding:utf-8-*-
+# -*- mode: python -*-
+# vi: set ft=python :
+import os
+import sys
+import logging
+import time
+
+import boto3
+from boto3.session import Session as session
+from optparse import OptionParser
+
+# 設定
+HEALTH_CHECK_TIMEOUT  = 60
+HEALTH_CHECK_INTERVAL = 2
+
+# debug用
+import pprint
+pprint.PrettyPrinter(indent=2)
+def pp(item):
+    pprint.pprint(item)
+
+# 出力
+def output_info(info, tags):
+    print '[%s]' % (info['elb_name'])
+    print 'tags:'
+    print '  Role : %s' % (info['role'])
+    print '  Env  : %s' % (info['env'])
+    print '  State: %s' % (info['state'])
+    print 'instances:'
+    print '  current'
+    if len(info['current']) == 0:
+        print '    no attachment'
+    else:
+        for i in info['current']:
+            print '    %s (%s)' % (tags[i]['Name'], i)
+    print '  new'
+    if len(info['new']) == 0:
+        print '    no attachment'
+    else:
+        for i in info['new']:
+            print '    %s (%s)' % (tags[i]['Name'], i)
+    print 'action:'
+    print '  %s' % info['action']
+    print ''
+
+# EC2に接続
+def connect_ec2(connection):
+    return connection.client('ec2')
+
+# ELBに接続
+def connect_elb(connection):
+    return connection.client('elb')
+
+# 対象となるELBインスタンスを取得
+def get_elb_list(conn, env, name):
+    target_elb   = {}
+    elb_all_list = {e["LoadBalancerName"]: e for e in conn.describe_load_balancers()["LoadBalancerDescriptions"]}
+    elb_tag_list = conn.describe_tags(LoadBalancerNames=elb_all_list.keys())
+
+    if len(elb_all_list) == 0 or elb_tag_list['ResponseMetadata']['HTTPStatusCode'] != 200:
+        logging.error('ELB API request error, type: get elb, code:' + str(status_code))
+    else:
+        for tag in elb_tag_list['TagDescriptions']:
+            tags = {t['Key']: t['Value'] for t in tag['Tags']}
+
+            if not tags.has_key('Env') or not tags.has_key('Role'):
+                continue
+
+            if tags['Env'] == env and tags['Role'] == name:
+                target_elb[tags['State']] = elb_all_list[tag['LoadBalancerName']]
+
+    return target_elb
+
+# 対象となるEC2インスタンス一覧を取得
+def get_ec2_list(conn, filter = []):
+    instance_list = {}
+    instances = conn.describe_instances(Filters=filter)
+
+    if instances['ResponseMetadata']['HTTPStatusCode'] != 200:
+        logging.error('ELB API request error, type: get instances, code:' + str(status_code))
+    else:
+        for i in instances['Reservations']:
+            tags = { t['Key']: t['Value'] for t in i['Instances'][0]['Tags'] }
+            if not instance_list.has_key(tags['State']):
+                instance_list[tags['State']] = []
+            instance_list[tags['State']].append(i['Instances'][0])
+
+    return instance_list
+
+# インスタンスをアタッチ/デタッチ
+def update_elb_instances(conn, elb_name, instances, type):
+    if type == 'regist':
+        logging.info('[' + elb_name + '] ' + 'Start registration to ELB: ' + str(instances))
+        result = conn.register_instances_with_load_balancer(LoadBalancerName=elb_name, Instances=instances)
+    elif type == 'deregist':
+        logging.info('[' + elb_name + '] ' + 'Start deregistration from ELB: ' + str(instances))
+        result = conn.deregister_instances_from_load_balancer(LoadBalancerName=elb_name, Instances=instances)
+    else:
+        return False
+
+    status_code = result['ResponseMetadata']['HTTPStatusCode']
+    if status_code != 200:
+        logging.error('ELB API request error, type: regist, code:' + str(status_code))
+        return False
+    return True
+
+# ヘルスチェック
+def elb_healthcheck(conn, elb_name, instances):
+    timeout = time.time() + HEALTH_CHECK_TIMEOUT
+    health_check_flg = True
+    logging.info('[' + elb_name + '] ' + 'Start health check')
+
+    while health_check_flg == True:
+        health_check = conn.describe_instance_health(LoadBalancerName=elb_name)
+        check_flg = True
+        for i in health_check['InstanceStates']:
+            # debug用
+            #print i['InstanceId'] + ': ' + i['State']
+            if i['State'] != 'InService':
+                check_flg = False
+        if check_flg == True:
+            logging.info('[' + elb_name+ '] ' + 'OK. All instance is InService')
+            return True
+        if time.time() > timeout:
+            health_check_flg = False
+        time.sleep(HEALTH_CHECK_INTERVAL)
+    else:
+        logging.error('Health check error')
+        run_failback(conn, elb_name, instances)
+        return False
+
+# failback処理
+def run_failback(conn, elb_name, instances):
+    logging.error('Try failback...')
+    message = 'Complete failback' if update_elb_instances(conn, elb_name, instances, 'deregist') is True else 'Failed failback'
+    logging.error(message)
+
+# bootstrap
+def main():
+    # options
+    parser = OptionParser()
+    parser.add_option("-k", "--aws_access_key", action="store", type="string", dest="aws_access_key", help="aws access key",             default=None)
+    parser.add_option("-s", "--aws_secret_key", action="store", type="string", dest="aws_secret_key", help="aws secret key",             default=None)
+    parser.add_option("-r", "--region",         action="store", type="string", dest="region",         help="export region name",         default="ap-northeast-1")
+    parser.add_option("-c", "--credentials",    action="store", type="string", dest="credentials",    help="credential file",            default=None)
+    parser.add_option("-p", "--profile",        action="store", type="string", dest="profile",        help="credential profile",         default="default")
+    parser.add_option("-n", "--name",           action="store", type="string", dest="name",           help="release role name(require)", default=None)
+    parser.add_option("-e", "--env",            action="store", type="string", dest="env",            help="environment(require)",       default=None)
+    parser.add_option("-v", "--verbose",        action="store_true",           dest="verbose",        help="verbose",                    default=False)
+    parser.add_option(      "--dry-run",        action="store_true",           dest="dry_run",        help="dry run mode",               default=False)
+    (options, args) = parser.parse_args()
+
+    # 詳細出力
+    log_level = logging.INFO if options.verbose else logging.ERROR
+    logging.basicConfig(format='[%(levelname)s] %(asctime)s %(message)s', datefmt='%Y/%m/%d %H:%M:%S', level=log_level)
+
+    # awsの認証関連の処理
+    if options.aws_access_key and options.aws_secret_key:
+        connection = session(aws_access_key_id=options.aws_access_key,
+                             aws_secret_access_key=options.aws_secret_key,
+                             region_name=options.region)
+    elif options.credentials:
+        if os.path.exists(options.credentials):
+            credential = ConfigParser.SafeConfigParser()
+            credential.read(options.credentials)
+            aws_access_key = credential.get(options.profile, 'aws_access_key_id')
+            aws_secret_key = credential.get(options.profile, 'aws_secret_access_key')
+            connection = session(aws_access_key_id=options.aws_access_key,
+                                 aws_secret_access_key=options.aws_secret_key,
+                                 region_name=options.region)
+        else:
+            logging.error(options.credentials + " is not found")
+            sys.exit(2)
+    else:
+        connection = boto3
+
+    if options.name is None:
+        logging.error("Release ELB Name is -n(--name) requirement")
+        sys.exit(2)
+
+    if options.env is None:
+        logging.error("Environment is -e(--env) requirement")
+        sys.exit(2)
+
+    #
+    # 処理の開始
+    #
+
+    ## ELBに接続
+    elb = connect_elb(connection)
+
+    ## 対象となるELBの取得
+    elb_list = get_elb_list(elb, options.env, options.name)
+
+    if len(elb_list) is 0:
+        logging.error("ELB is Not Found (Env: %s, Role: %s)" % (options.env, options.name))
+        sys.exit(2)
+
+    ## EC2に接続
+    ec2 = connect_ec2(connection)
+
+    ## 対象となるEC2インスタンスの取得
+    instances = get_ec2_list(ec2, [{'Name': 'tag-key', 'Values':['Role']}, {'Name': 'tag:Env', 'Values':[options.env]}])
+
+    ## インスタンスのタグを取得(表示上わかりやすくするため)
+    instances_tags = {}
+    for instance in instances.values():
+        for i in instance:
+            instances_tags[i['InstanceId']] = { t['Key']: t['Value'] for t in i['Tags'] }
+
+    ## instanceの取得に失敗していたら終了
+    if len(instances) is 0:
+        logging.error("Instance is Not Found (Search result is 0)")
+        sys.exit(2)
+
+    ## runningタグがつけられているインスタンスが0だったらwarning出して終了
+    if not instances.has_key('running'):
+        logging.warning("Running Tag Instance is 0")
+        sys.exit(2)
+
+    ## インスタンスをELBにアタッチする
+    for state,elb_info in elb_list.iteritems():
+        info = {}
+        elb_name = elb_info['LoadBalancerName']
+
+        current_elb_instances = sorted([ i['InstanceId'] for i in elb_info['Instances'] ])
+        attach_elb_instances  = sorted([ i['InstanceId'] for i in instances[state] ]) if instances.has_key(state) else []
+        detach_elb_instances  = sorted(list(set(current_elb_instances) - set(attach_elb_instances)))
+
+        info['elb_name'] = elb_name
+        info['role']     = options.name
+        info['env']      = options.env
+        info['state']    = state
+        info['current']  = current_elb_instances
+        info['new']      = attach_elb_instances
+        info['action']   = 'no change' if current_elb_instances == attach_elb_instances else 'change'
+
+        if options.dry_run is True:
+            info['action'] = info['action'] + ' (dry run mode)'
+            output_info(info, instances_tags)
+            continue
+
+        output_info(info, instances_tags)
+
+        ## attach
+        if current_elb_instances != attach_elb_instances and len(attach_elb_instances) != 0:
+            if update_elb_instances(elb, elb_name, [ { 'InstanceId': i } for i in attach_elb_instances ], 'regist') is False:
+                continue
+
+            if elb_healthcheck(elb, elb_name, [ { 'InstanceId': i } for i in attach_elb_instances ]) is False:
+                logging.error('Error! ' + elb_name + ' attachment process')
+                sys.exit(2)
+
+        ## detach
+        if len(detach_elb_instances) != 0:
+            if update_elb_instances(elb, elb_name, [ { 'InstanceId': i } for i in detach_elb_instances ], 'deregist') is False:
+                run_failback(elb, elb_name, [ { 'InstanceId': i } for i in attach_elb_instances ])
+                logging.error('Error! ' + elb_name + ' attachment process')
+                sys.exit(2)
+
+        print 'done ...'
+
+if __name__ == '__main__':
+    main()

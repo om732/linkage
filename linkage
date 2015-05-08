@@ -202,7 +202,7 @@ def main():
     ec2 = connect_ec2(connection)
 
     ## 対象となるEC2インスタンスの取得
-    instances = get_ec2_list(ec2, [{'Name': 'tag-key', 'Values':['Role']}, {'Name': 'tag:Env', 'Values':[options.env]}])
+    instances = get_ec2_list(ec2, [{'Name': 'tag:Role', 'Values':[options.name]}, {'Name': 'tag:Env', 'Values':[options.env]}])
 
     ## インスタンスのタグを取得(表示上わかりやすくするため)
     instances_tags = {}

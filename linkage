@@ -12,7 +12,7 @@ from boto3.session import Session as session
 from optparse import OptionParser
 
 # 設定
-HEALTH_CHECK_TIMEOUT  = 60
+HEALTH_CHECK_TIMEOUT  = 120
 HEALTH_CHECK_INTERVAL = 2
 
 # debug用
@@ -153,7 +153,7 @@ def main():
     (options, args) = parser.parse_args()
 
     # 詳細出力
-    log_level = logging.INFO if options.verbose else logging.ERROR
+    log_level = logging.INFO if options.verbose else logging.WARNING
     logging.basicConfig(format='[%(levelname)s] %(asctime)s %(message)s', datefmt='%Y/%m/%d %H:%M:%S', level=log_level)
 
     # awsの認証関連の処理
